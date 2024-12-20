@@ -134,7 +134,7 @@ def daily_task():
 
 def run_scheduler():
     """Run the scheduler in a separate thread"""
-    schedule.every().day.at("10:00").do(daily_task)
+    schedule.every().day.at("08:00").do(daily_task)
     while True:
         schedule.run_pending()
         time.sleep(60)
