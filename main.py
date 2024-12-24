@@ -1,5 +1,4 @@
 from flask import Flask, jsonify, render_template
-from text_cleaner import read_json_file, write_json_file
 import tweepy
 import json
 import schedule
@@ -8,8 +7,12 @@ import logging
 import os
 from datetime import datetime
 import threading
+from flask_sqlalchemy import SQLAlchemy
+import pytz
 
 app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///quotes.db"
+db = SQLAlchemy(app)
 
 # Set up logging
 logging.basicConfig(
@@ -20,6 +23,27 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+class Quote(db.Model):
+    __tablename__ = "qoutes"
+    
+    id = db.Column(db.Integer, primary_key=True)
+    text = db.Column(db.String, nullable=False)
+    page = db.Column(db.String)
+    tweeted = db.Column(db.Boolean, default=False)
+    tweeted_at = db.Column(db.DateTime)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'text': self.text,
+            'page': self.page,
+            'tweeted': self.tweeted,
+            'tweeted_at': self.tweeted_at.isoformat() if self.tweeted_at else None,
+        }
+        
+with app.app_context():
+    db.create_all()
 
 def create_api():
     """
@@ -88,53 +112,47 @@ class TweetThreadHandler:
             
         return chunks
 
-def read_quote():
+def post_quote():
     try:
-        # Create thread handler instance
+        quote = Quote.query.filter_by(tweeted=False).first()
+        
+        if not quote:
+            logging.info("All qoutes have been tweeted")
+            return {"success": False, "error": "All quotes have been tweeted"}
+        
         thread_handler = TweetThreadHandler(client)
         
-        # Load quotes and tweeted data
-        quotes = read_json_file("./data/data.json")
-        tweeted = read_json_file("./data/tweeted.json")
+        tweets = thread_handler.post_quote_thread(quote.text, quote.page)
         
-        # Iterate through all quotes to find one not yet tweeted
-        for quote in quotes:
-            if quote not in tweeted:
-                logging.info(f"Posting new quote: {quote}")
-                
-                quote_text = quote["Quote"]
-                page = quote["Page"]
-                
-                # Post the quote
-                tweets = thread_handler.post_quote_thread(quote_text, page)
-                
-                if tweets:
-                    # Add the quote to the tweeted list
-                    tweeted.append(quote)
-                    write_json_file("./data/tweeted.json", tweeted)
-                    logging.info("Quote posted successfully")
-                    return {"success": True, "quote": quote}
-        
-        logging.info("All quotes have been tweeted")
-        return {"success": False, "error": "All quotes have been tweeted"}
-        
-    except Exception as e:
-        logging.error(f"Error in read_quote: {str(e)}")
-        return {"success": False, "error": str(e)}
+        if tweets:
+            # Update quote status
+            quote.tweeted = True
+            quote.tweeted_at = datetime.utcnow()
+            db.session.commit()
+            logging.info(f"Successfully posted quote ID {quote.id}")
+            return {"success": True, "quote": quote.to_dict()}
+        else:
+            return {"success": False, "error": "Failed to post tweet"}
 
-def daily_task():
-    """Function that will be run daily"""
-    logging.info("Starting daily quote tweet task")
-    result = read_quote()
-    if result["success"]:
-        logging.info(f"Daily task completed successfully. Posted quote: {result['quote']}")
-    else:
-        logging.warning(f"Daily task failed: {result.get('error', 'Unknown error')}")
-    return result
+    except Exception as e:
+        db.session.rollback()
+        logging.error(f"Error posting quote: {str(e)}")
+        return {"success": False, "error": str(e)}
+    finally:
+        db.session.close()
 
 def run_scheduler():
-    """Run the scheduler in a separate thread"""
-    schedule.every().day.at("08:00").do(daily_task)
+    """Run the scheduler in a separate thread using UTC time"""
+    utc = pytz.UTC
+    local_tz = pytz.timezone('Africa/Nairobi')  # Change to your timezone
+    
+    local_time = local_tz.localize(datetime.strptime("08:07", "%H:%M"))
+    utc_time = local_time.astimezone(utc).strftime("%H:%M")
+    
+    schedule.every().day.at(utc_time).do(post_quote)
+    
+    logging.info(f"Scheduler started. Bot will post daily at {utc_time} UTC")
+    
     while True:
         schedule.run_pending()
         time.sleep(60)
@@ -147,46 +165,41 @@ client = create_api()
 def home():
     """Home page with basic statistics"""
     try:
-        with open("./data/data.json", "r", encoding="utf-8") as f:
-            quotes = json.load(f)
-        with open("./data/tweeted.json", "r", encoding="utf-8") as f:
-            tweeted = json.load(f)
+        total_quotes = db.session.query(Quote).count()
+        tweeted_quotes = db.session.query(Quote).filter_by(tweeted=True).count()
+        last_tweet = db.session.query(Quote).filter_by(tweeted=True)\
+            .order_by(Quote.tweeted_at.desc()).first()
         
         stats = {
-            "total_quotes": len(quotes),
-            "tweeted_quotes": len(tweeted),
-            "remaining_quotes": len(quotes) - len(tweeted),
-            "last_tweet_time": datetime.fromtimestamp(
-                os.path.getmtime("./data/tweeted.json")
-            ).strftime('%Y-%m-%d %H:%M:%S')
+            "total_quotes": total_quotes,
+            "tweeted_quotes": tweeted_quotes,
+            "remaining_quotes": total_quotes - tweeted_quotes,
+            "last_tweet_time": last_tweet.tweeted_at.strftime('%Y-%m-%d %H:%M:%S') if last_tweet else "Never"
         }
         
         return render_template('index.html', stats=stats)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    finally:
+        db.session.close()
 
 @app.route('/post-quote', methods=['POST'])
-def post_quote():
+def trigger_post_quote():
     """Endpoint to manually trigger a quote post"""
-    result = read_quote()
-    return jsonify(result)
+    return jsonify(post_quote())
 
 @app.route('/stats')
 def get_stats():
     """Get current statistics"""
     try:
-        with open("./data/data.json", "r", encoding="utf-8") as f:
-            quotes = json.load(f)
-        with open("./data/tweeted.json", "r", encoding="utf-8") as f:
-            tweeted = json.load(f)
+        total_quotes = db.session.query(Quote).count()
+        tweeted_quotes = db.session.query(Quote).filter_by(tweeted=True).count()
         
         return jsonify({
-            "total_quotes": len(quotes),
-            "tweeted_quotes": len(tweeted),
-            "remaining_quotes": len(quotes) - len(tweeted)
+            "total_quotes": total_quotes,
+            "tweeted_quotes": tweeted_quotes,
+            "remaining_quotes": total_quotes - tweeted_quotes
         })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    finally:
+        db.session.close()
 
 if __name__ == "__main__":
     # Start the scheduler in a separate thread
