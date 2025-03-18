@@ -5,7 +5,7 @@ import schedule
 import time
 import logging
 import os
-from datetime import datetime
+import datetime
 import threading
 from flask_sqlalchemy import SQLAlchemy
 import pytz
@@ -141,22 +141,6 @@ def post_quote():
     finally:
         db.session.close()
 
-def run_scheduler():
-    """Run the scheduler in a separate thread using UTC time"""
-    utc = pytz.UTC
-    local_tz = pytz.timezone('Africa/Nairobi')  # Change to your timezone
-    
-    local_time = local_tz.localize(datetime.strptime("08:07", "%H:%M"))
-    utc_time = local_time.astimezone(utc).strftime("%H:%M")
-    
-    schedule.every().day.at(utc_time).do(post_quote)
-    
-    logging.info(f"Scheduler started. Bot will post daily at {utc_time} UTC")
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-
 # Create API client
 client = create_api()
 
@@ -201,11 +185,17 @@ def get_stats():
     finally:
         db.session.close()
 
+target_time = datetime.time(10,0,0)
+current_time = datetime.datetime.now().time()
+
+print(f"Target time: {target_time}")
+print(current_time)
+
 if __name__ == "__main__":
-    # Start the scheduler in a separate thread
-    scheduler_thread = threading.Thread(target=run_scheduler)
-    scheduler_thread.daemon = True
-    scheduler_thread.start()
-    
     # Run the Flask app
     app.run(debug=True, host='0.0.0.0', port=5000)
+    
+    if target_time == current_time:
+        post_quote()
+    
+    
